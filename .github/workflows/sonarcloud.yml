@@ -1,0 +1,115 @@
+
+name: Grilo SC Analysis for Java (Maven/Gradle)
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  workflow_dispatch: {}
+
+jobs:
+  sonar-analysis:
+    name: SonarCloud Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # DETECÇÃO E INSTALAÇÃO DINÂMICA (CORRIGIDA)
+      - name: Setup Build Environment
+        id: setup_env
+        run: |
+          # 1. Tenta achar Maven
+          POM_PATH=$(find . -maxdepth 3 -name "pom.xml" -not -path "*/target/*" | head -n 1)
+          
+          if [ -n "$POM_PATH" ]; then
+            echo "✅ Maven detectado em: $POM_PATH"
+            echo "build_system=maven" >> $GITHUB_OUTPUT
+            echo "build_file=$POM_PATH" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 2. Tenta achar Gradle (qualquer arquivo de build)
+          GRADLE_FILE=$(find . -maxdepth 3 \( -name "build.gradle" -o -name "build.gradle.kts" \) -type f | head -n 1)
+          
+          if [ -n "$GRADLE_FILE" ]; then
+            echo "✅ Gradle detectado em: $GRADLE_FILE"
+            echo "build_system=gradle" >> $GITHUB_OUTPUT
+            echo "build_file=$GRADLE_FILE" >> $GITHUB_OUTPUT
+            
+            # CORREÇÃO CRÍTICA: Busca o properties de forma INDEPENDENTE
+            PROPS=$(find . -name "gradle-wrapper.properties" -type f | head -n 1)
+            
+            # Valor padrão seguro (último recurso)
+            TARGET_VERSION="8.10.2"
+            
+            if [ -f "$PROPS" ]; then
+               echo "📄 Arquivo de propriedades encontrado: $PROPS"
+               ver=$(grep -oE 'gradle-[0-9.]+(-(bin|all))?\.zip' "$PROPS" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1)
+               if [ -n "$ver" ]; then
+                 TARGET_VERSION="$ver"
+                 echo "✅ Versão detectada no projeto: $TARGET_VERSION"
+               else
+                 echo "⚠️ Não foi possível extrair versão do properties, usando default: $TARGET_VERSION"
+               fi
+            else
+               echo "⚠️ Arquivo gradle-wrapper.properties não encontrado, usando default: $TARGET_VERSION"
+            fi
+            
+            # Salva a versão detectada para uso nos próximos steps
+            echo "detected_gradle_ver=$TARGET_VERSION" >> $GITHUB_OUTPUT
+            
+            # Baixa e instala a versão exata detectada (ou default)
+            echo "⬇️ Baixando Gradle $TARGET_VERSION oficial..."
+            wget -q "https://services.gradle.org/distributions/gradle-${TARGET_VERSION}-bin.zip"
+            unzip -q "gradle-${TARGET_VERSION}-bin.zip"
+            echo "GRADLE_HOME=$PWD/gradle-${TARGET_VERSION}/bin" >> $GITHUB_ENV
+            echo "$PWD/gradle-${TARGET_VERSION}/bin" >> $GITHUB_PATH
+            echo "✅ Gradle $TARGET_VERSION instalado com sucesso"
+          else
+             echo "⚠️ Nenhum build system detectado"
+             echo "build_system=unknown" >> $GITHUB_OUTPUT
+          fi
+
+      # Java 21 é retrocompatível e roda Gradle novo.
+      - name: Set up JDK 21
+        uses: actions/setup-java@v3
+        with:
+          java-version: 21
+          distribution: 'temurin'
+
+      # --- MAVEN ---
+      - name: Maven Analysis
+        if: steps.setup_env.outputs.build_system == 'maven'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar -Dmaven.test.skip=true -f ${{ steps.setup_env.outputs.build_file }} -Dsonar.projectKey=grilo-org_20260129T135224_miguelDK17_Breeze -Dsonar.projectName=20260129T135224_miguelDK17_Breeze -Dsonar.host.url=https://sonarcloud.io -Dsonar.organization=grilo-org
+
+      # --- GRADLE (USANDO A VERSÃO BAIXADA) ---
+      - name: Gradle Analysis (Dynamic Version)
+        if: steps.setup_env.outputs.build_system == 'gradle'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+           # Vamos até a pasta do projeto
+           BUILD_DIR=$(dirname "${{ steps.setup_env.outputs.build_file }}")
+           cd "$BUILD_DIR"
+           
+           echo "🚀 Iniciando análise com Gradle (Versão: ${{ steps.setup_env.outputs.detected_gradle_ver }})..."
+           gradle -v
+           
+           # 'compileDebugSources' evita erros de assets faltantes
+           # '--continue' permite que a análise prossiga mesmo com erros parciais
+           gradle compileDebugSources sonarqube -x test -x lint --no-daemon --continue \
+             -Dsonar.projectKey=grilo-org_20260129T135224_miguelDK17_Breeze \
+             -Dsonar.projectName=20260129T135224_miguelDK17_Breeze \
+             -Dsonar.organization=grilo-org \
+             -Dsonar.host.url=https://sonarcloud.io \
+             -Dsonar.java.binaries=**/build/classes,**/build/intermediates/javac,**/build/tmp/kotlin-classes \
+             -Dsonar.sources=. \
+             -Dsonar.exclusions=**/*.class || \
+           echo "⚠️ Build principal falhou, mas análise pode ter gerado resultados parciais."
